@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+  <meta charset="UTF-8" />
+  <title>Katseen, Pään & Verkon Seuranta - MediaPipe</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      background: #121212;
+      color: white;
+    }
+    .container {
+      position: relative;
+      width: 640px;
+      height: 480px;
+    }
+    video, canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 640px;
+      height: 480px;
+      transform: scaleX(-1);
+    }
+    #info-panel {
+      margin-top: 10px;
+      background: #222;
+      padding: 15px;
+      border-radius: 8px;
+      width: 610px;
+      font-family: monospace;
+    }
+    .alert {
+      color: #ff4d4d;
+      font-weight: bold;
+    }
+    .ok {
+      color: #4df3ff;
+      font-weight: bold;
+    }
+  </style>
+
+  <script type="module">
+    import { FaceLandmarker, FilesetResolver, DrawingUtils } 
+      from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
+
+    const video = document.getElementById("webcam");
+    const canvasElement = document.getElementById("output_canvas");
+    const canvasCtx = canvasElement.getContext("2d");
+    
+    const headSideStatusEl = document.getElementById("head-side-status");
+    const headUpStatusEl = document.getElementById("head-up-status");
+    const gazeStatusEl = document.getElementById("gaze-status");
+    const alertBoxEl = document.getElementById("alert-box");
+
+    let headUpHistory = []; // Tasoittaa pään pystyliikkeen mittausta
+    let awayFrameCount = 0; // Laskee kuinka monta ruutua putkeen katse on ollut poissa
+
+    let faceLandmarker;
+    let lastVideoTime = -1;
+
+    async function createFaceLandmarker() {
+      const filesetResolver = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+      );
+      
+      faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+        baseOptions: {
+          modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numFaces: 1
+      });
+      
+      startCamera();
+    }
+
+    function startCamera() {
+      navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } })
+        .then((stream) => {
+          video.srcObject = stream;
+          video.addEventListener("loadeddata", predictWebcam);
+        });
+    }
+
+    async function predictWebcam() {
+      canvasElement.width = video.videoWidth;
+      canvasElement.height = video.videoHeight;
+      const drawingUtils = new DrawingUtils(canvasCtx);
+
+      if (lastVideoTime !== video.currentTime) {
+        lastVideoTime = video.currentTime;
+        const results = faceLandmarker.detectForVideo(video, performance.now());
+
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+        if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+            const lm = results.faceLandmarks[0];
+
+            // 1. PIIRRETÄÄN KASVOVERKKO (MESH)
+            // Piirretään perusverkko vaaleanharmaalla
+            drawingUtils.drawConnectors(
+                lm,
+                FaceLandmarker.FACE_LANDMARKS_TESSELATION,
+                { color: "#C0C0C030", lineWidth: 1 } 
+            );
+            
+            // Piirretään silmien, kulmakarvojen ja huulten ääriviivat
+            drawingUtils.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE, { color: "#FF3030", lineWidth: 1 });
+            drawingUtils.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_LEFT_EYE, { color: "#30FF30", lineWidth: 1 });
+            drawingUtils.drawConnectors(lm, FaceLandmarker.FACE_LANDMARKS_FACE_OVAL, { color: "#E0E0E0", lineWidth: 1 });
+
+            // Piirretään pupillit ja nenänpää korostettuna
+            [1, 468, 473].forEach(index => {
+                const pt = lm[index];
+                canvasCtx.beginPath();
+                canvasCtx.arc(pt.x * canvasElement.width, pt.y * canvasElement.height, 4, 0, 2 * Math.PI);
+                canvasCtx.fillStyle = "blue"; // Siniset pisteet seurattaville kohdille
+                canvasCtx.fill();
+            });
+
+
+            // 2. PÄÄN SIVUILLE KÄÄNTYMISEN LASKENTA
+            const noseX = lm[1].x;
+            const leftEdge = lm[234].x;
+            const rightEdge = lm[454].x;
+            const headTurnRatio = (noseX - leftEdge) / (rightEdge - leftEdge);
+
+            let isHeadTurnedSide = false;
+            if (headTurnRatio < 0.30 || headTurnRatio > 0.70) {
+                isHeadTurnedSide = true;
+            }
+
+            // 3. PÄÄN YLÖS NOSTAMISEN LASKENTA
+            // Verrataan nenänpään (1) Y-koordinaattia silmien yläpuolella olevan otsapisteen (10) 
+            // ja leuan (152) suhteeseen.
+            const noseY = lm[1].y;
+            const foreheadY = lm[10].y;
+            const chinY = lm[152].y;
+            const headUpRatio = (noseY - foreheadY) / (chinY - foreheadY);
+
+            let isHeadTurnedUp = false;
+            // Pään nosto: Jos nenä nousee liian lähelle otsaa (Y-arvo pienenee), suhde laskee.
+            if (headUpRatio < 0.45) {
+                isHeadTurnedUp = true;
+            }
+
+            // 4. PUPILLIN / KATSEEN SUUNNAN LASKENTA 
+            const pupilX = lm[468].x;
+            const eyeLeftCorner = lm[33].x;
+            const eyeRightCorner = lm[133].x;
+            const eyeGazeRatio = (pupilX - eyeLeftCorner) / (eyeRightCorner - eyeLeftCorner);
+
+            let isLookingAway = false;
+            if (eyeGazeRatio < 0.38 || eyeGazeRatio > 0.62) {
+                isLookingAway = true;
+            }
+
+
+            // 5. NÄYTETÄÄN TULOKSET JA VAROITUKSET
+            headSideStatusEl.innerText = headTurnRatio.toFixed(2) + (isHeadTurnedSide ? " (KÄÄNTYNYT SIVULLE)" : " (OK)");
+            headUpStatusEl.innerText = headUpRatio.toFixed(2) + (isHeadTurnedUp ? " (NOSTETTU YLÖS)" : " (OK)");
+            gazeStatusEl.innerText = eyeGazeRatio.toFixed(2) + (isLookingAway ? " (SIVULLA)" : " (KESKELLÄ)");
+
+            // Tarkistetaan onko jokin raja ylittynyt tällä kehyksellä
+            const rawIsAway = isHeadTurnedSide || isHeadTurnedUp || isLookingAway;
+
+            if (rawIsAway) {
+                awayFrameCount++;
+            } else {
+                awayFrameCount = 0; // Nollataan heti kun katsotaan taas ruutuun
+            }
+
+            // Näytetään hälytys vasta kun poikkeama on kestänyt vähintään 3 kehystä
+            if (awayFrameCount > 3) {
+                let message = "⚠️ ";
+                if (isHeadTurnedSide) message += "KÄÄNNYIT SIVULLE! ";
+                if (isHeadTurnedUp) message += "NOSTIT PÄÄN YLÖS! ";
+                if (isLookingAway) message += "KATSOIT SIVULLE! ";
+
+                alertBoxEl.innerText = message;
+                alertBoxEl.className = "alert";
+
+                canvasCtx.font = "bold 24px sans-serif";
+                canvasCtx.fillStyle = "red";
+                canvasCtx.fillText("HUOMIO POISSA!", 20, 50);
+            } else {
+                alertBoxEl.innerText = "Katsot ruutuun";
+                alertBoxEl.className = "ok";
+            }
+        }
+        
+
+      }
+
+      window.requestAnimationFrame(predictWebcam);
+    }
+
+
+    createFaceLandmarker();
+
+
+  </script>
+</head>
+<body>
+  <h2>MediaPipe Täysi Seuranta & Verkko</h2>
+
+  <div class="container">
+    <video id="webcam" autoplay playsinline></video>
+    <canvas id="output_canvas"></canvas>
+  </div>
+
+  <div id="info-panel">
+    <p>Pään kääntyminen sivulle: <span id="head-side-status">-</span> </p>
+    <p>Pään nosto ylös: <span id="head-up-status">-</span></p>
+    <p>Pupillin paikka silmässä: <span id="gaze-status">-</span></p>
+    <p>Tila: <span id="alert-box" class="ok">Alustetaan...</span></p>
+  </div>
+</body>
+</html>
